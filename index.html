@@ -1,0 +1,482 @@
+// ============================================================
+// GACOR HUNTER — Algorithm core (tested standalone in Node first)
+// This exact code will be embedded into the final HTML <script>.
+// ============================================================
+
+// ---------- Seeded PRNG (mulberry32) ----------
+function makeRng(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hashSeed(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++) { h = Math.imul(31, h) + str.charCodeAt(i) | 0; }
+  return h >>> 0;
+}
+
+// ---------- Mock OHLCV generator ----------
+function generateMockOHLCV(config, days = 260) {
+  const rng = makeRng(hashSeed(config.code));
+  const bars = [];
+  let price = config.basePrice;
+  const today = new Date();
+  let d = new Date(today);
+  d.setDate(d.getDate() - days * 1.45); // skip weekends roughly
+
+  for (let i = 0; i < days; i++) {
+    // advance date, skip weekends
+    d.setDate(d.getDate() + 1);
+    while (d.getDay() === 0 || d.getDay() === 6) d.setDate(d.getDate() + 1);
+
+    let drift = config.trendBias;
+    // event injection near the end of the series
+    const fromEnd = days - i;
+    if (config.event === 'breakout' && fromEnd <= 12 && fromEnd > 4) drift += 0.012;
+    if (config.event === 'breakout' && fromEnd <= 4) drift += 0.02;
+    if (config.event === 'downtrend' && fromEnd <= 30) drift -= 0.006;
+    if (config.event === 'pullback' && fromEnd <= 20 && fromEnd > 8) drift -= 0.006;
+    if (config.event === 'pullback' && fromEnd <= 8) drift += 0.004;
+    if (config.event === 'consolidation' && fromEnd <= 40) drift *= 0.2;
+
+    const noise = (rng() - 0.5) * config.volatility;
+    const changePct = drift + noise;
+    const open = price;
+    let close = open * (1 + changePct);
+    if (close < config.basePrice * 0.25) close = config.basePrice * 0.25; // floor
+    const range = Math.abs(close - open) + open * config.volatility * 0.6 * rng();
+    const high = Math.max(open, close) + range * rng() * 0.6;
+    const low = Math.min(open, close) - range * rng() * 0.6;
+
+    const baseVol = config.baseVolume * (1 + (rng() - 0.5) * 0.6);
+    let volMult = 1;
+    if (config.event === 'breakout' && fromEnd <= 12) volMult = 1.4 + rng() * 1.2;
+    else if (Math.abs(changePct) > config.volatility * 0.8) volMult = 1.2 + rng() * 0.6;
+    const volume = Math.max(100000, Math.round(baseVol * volMult));
+
+    bars.push({
+      date: d.toISOString().slice(0, 10),
+      open: round2(open), high: round2(high), low: round2(Math.max(1, low)),
+      close: round2(Math.max(1, close)), volume,
+    });
+    price = close;
+  }
+  return bars;
+}
+function round2(n) { return Math.round(n * 100) / 100; }
+
+// ---------- Indicators ----------
+function sma(values, period) {
+  const out = new Array(values.length).fill(null);
+  let sum = 0;
+  for (let i = 0; i < values.length; i++) {
+    sum += values[i];
+    if (i >= period) sum -= values[i - period];
+    if (i >= period - 1) out[i] = sum / period;
+  }
+  return out;
+}
+
+function calculateEMA(values, period) {
+  const k = 2 / (period + 1);
+  const out = new Array(values.length).fill(null);
+  if (values.length < period) return out;
+  let seed = 0;
+  for (let i = 0; i < period; i++) seed += values[i];
+  out[period - 1] = seed / period;
+  for (let i = period; i < values.length; i++) {
+    out[i] = values[i] * k + out[i - 1] * (1 - k);
+  }
+  return out;
+}
+
+function calculateRSI(closes, period = 14) {
+  const out = new Array(closes.length).fill(null);
+  if (closes.length < period + 1) return out;
+  let gainSum = 0, lossSum = 0;
+  for (let i = 1; i <= period; i++) {
+    const ch = closes[i] - closes[i - 1];
+    if (ch >= 0) gainSum += ch; else lossSum -= ch;
+  }
+  let avgGain = gainSum / period, avgLoss = lossSum / period;
+  out[period] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+  for (let i = period + 1; i < closes.length; i++) {
+    const ch = closes[i] - closes[i - 1];
+    const gain = ch > 0 ? ch : 0, loss = ch < 0 ? -ch : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+    out[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+  }
+  return out;
+}
+
+function calculateMACD(closes, fast = 12, slow = 26, signalP = 9) {
+  const emaFast = calculateEMA(closes, fast);
+  const emaSlow = calculateEMA(closes, slow);
+  const macdLine = closes.map((_, i) => (emaFast[i] != null && emaSlow[i] != null) ? emaFast[i] - emaSlow[i] : null);
+  const firstValid = macdLine.findIndex(v => v !== null);
+  const signalLine = new Array(closes.length).fill(null);
+  if (firstValid !== -1) {
+    const validMacd = macdLine.slice(firstValid);
+    const emaSig = calculateEMA(validMacd, signalP);
+    for (let i = 0; i < emaSig.length; i++) signalLine[firstValid + i] = emaSig[i];
+  }
+  const histogram = closes.map((_, i) => (macdLine[i] != null && signalLine[i] != null) ? macdLine[i] - signalLine[i] : null);
+  return { macdLine, signalLine, histogram };
+}
+
+function calculateIndicators(ohlcv) {
+  const closes = ohlcv.map(d => d.close);
+  const volumes = ohlcv.map(d => d.volume);
+  const n = closes.length;
+  const ma20Arr = sma(closes, 20), ma50Arr = sma(closes, 50), ma200Arr = sma(closes, 200);
+  const volMA20Arr = sma(volumes, 20);
+  const rsiArr = calculateRSI(closes, 14);
+  const { macdLine, signalLine, histogram } = calculateMACD(closes);
+  const last = n - 1;
+  const currentPrice = closes[last];
+  const prevClose = closes[last - 1];
+  const window52 = ohlcv.slice(Math.max(0, n - 252));
+  const high52w = Math.max(...window52.map(d => d.high));
+
+  return {
+    ma20: ma20Arr[last], ma50: ma50Arr[last], ma200: ma200Arr[last],
+    ma20Arr, ma50Arr, ma200Arr,
+    volMA20: volMA20Arr[last], volMA20Arr,
+    volMA20Ratio: volMA20Arr[last] ? volumes[last] / volMA20Arr[last] : null,
+    rsi: rsiArr[last], rsiArr,
+    macd: macdLine[last], signal: signalLine[last], histogram: histogram[last],
+    macdArr: macdLine, signalArr: signalLine, histogramArr: histogram,
+    macdBullish: macdLine[last] != null && signalLine[last] != null && macdLine[last] > signalLine[last],
+    macdHistRising: histogram[last] != null && histogram[last - 1] != null && histogram[last] > histogram[last - 1],
+    dailyReturnPct: prevClose ? ((currentPrice - prevClose) / prevClose * 100) : 0,
+    priceAbovePrevClose: currentPrice > prevClose,
+    high52w,
+    pctOf52WHigh: high52w ? (currentPrice / high52w * 100) : null,
+    extendedFromMA20Pct: ma20Arr[last] ? ((currentPrice - ma20Arr[last]) / ma20Arr[last] * 100) : 0,
+    currentPrice, prevClose,
+  };
+}
+
+// ---------- Market structure ----------
+function findSwingPoints(ohlcv, lookback = 3) {
+  const swings = [];
+  for (let i = lookback; i < ohlcv.length - lookback; i++) {
+    const windowSlice = ohlcv.slice(i - lookback, i + lookback + 1);
+    const highs = windowSlice.map(d => d.high);
+    const lows = windowSlice.map(d => d.low);
+    if (ohlcv[i].high === Math.max(...highs)) swings.push({ index: i, type: 'high', price: ohlcv[i].high, date: ohlcv[i].date });
+    if (ohlcv[i].low === Math.min(...lows)) swings.push({ index: i, type: 'low', price: ohlcv[i].low, date: ohlcv[i].date });
+  }
+  return swings;
+}
+
+function detectStructure(ohlcv, swings) {
+  const highs = swings.filter(s => s.type === 'high').sort((a, b) => a.index - b.index);
+  const lows = swings.filter(s => s.type === 'low').sort((a, b) => a.index - b.index);
+  let lastSwingHighType = null, lastSwingLowType = null;
+  if (highs.length >= 2) {
+    const [p, l] = highs.slice(-2);
+    lastSwingHighType = l.price > p.price ? 'HH' : 'LH';
+  }
+  if (lows.length >= 2) {
+    const [p, l] = lows.slice(-2);
+    lastSwingLowType = l.price > p.price ? 'HL' : 'LL';
+  }
+  let trend = 'Sideways';
+  if (lastSwingHighType === 'HH' && lastSwingLowType === 'HL') trend = 'Bullish';
+  else if (lastSwingHighType === 'LH' && lastSwingLowType === 'LL') trend = 'Bearish';
+
+  const lastSwingHigh = highs[highs.length - 1] || null;
+  const lastSwingLow = lows[lows.length - 1] || null;
+
+  // phase: consolidation if recent range is tight
+  const n = ohlcv.length;
+  const recent = ohlcv.slice(Math.max(0, n - 15));
+  const recentHigh = Math.max(...recent.map(d => d.high));
+  const recentLow = Math.min(...recent.map(d => d.low));
+  const recentRangePct = (recentHigh - recentLow) / recentLow;
+  const isHealthyConsolidation = recentRangePct < 0.08 && trend !== 'Bearish';
+
+  return {
+    trend, lastSwingHighType, lastSwingLowType, lastSwingHigh, lastSwingLow,
+    prevSwingHigh: highs[highs.length - 2] || null, prevSwingLow: lows[lows.length - 2] || null,
+    allHighs: highs, allLows: lows, isHealthyConsolidation,
+  };
+}
+
+// ---------- Support / Resistance ----------
+function calculateSupportResistance(ohlcv, indicators, structure, currentPrice) {
+  const supports = [];
+  const resistances = [];
+
+  if (structure.lastSwingLow) supports.push({ label: 'Swing Low', price: structure.lastSwingLow.price });
+  if (structure.lastSwingHigh) {
+    if (structure.lastSwingHigh.price < currentPrice) supports.push({ label: 'Former Resistance (Breakout)', price: structure.lastSwingHigh.price });
+    else resistances.push({ label: 'Swing High', price: structure.lastSwingHigh.price });
+  }
+  if (structure.prevSwingHigh && structure.prevSwingHigh.price > currentPrice) {
+    resistances.push({ label: 'Prior Swing High', price: structure.prevSwingHigh.price });
+  }
+  if (indicators.ma20 != null && indicators.ma20 < currentPrice) supports.push({ label: 'MA20', price: indicators.ma20 });
+  if (indicators.ma50 != null && indicators.ma50 < currentPrice) supports.push({ label: 'MA50', price: indicators.ma50 });
+  if (indicators.high52w > currentPrice) resistances.push({ label: '52W High', price: indicators.high52w });
+
+  const validSupports = supports.filter(s => s.price < currentPrice).sort((a, b) => b.price - a.price);
+  const validResistances = resistances.filter(r => r.price > currentPrice).sort((a, b) => a.price - b.price);
+
+  const mainSupport = validSupports[0] || null;
+  const nextSupport = validSupports[1] || null;
+  const invalidation = mainSupport ? (nextSupport ? nextSupport.price * 0.99 : mainSupport.price * 0.97) : null;
+
+  const nearestResistance = validResistances[0] || null;
+  const strongResistance = validResistances[1] || (indicators.high52w > currentPrice ? { label: '52W High', price: indicators.high52w } : null);
+
+  return { mainSupport, nextSupport, invalidation, nearestResistance, strongResistance, allSupports: validSupports, allResistances: validResistances };
+}
+
+// ---------- Fibonacci ----------
+function calculateFibonacci(structure) {
+  const sh = structure.lastSwingHigh, sl = structure.lastSwingLow;
+  if (!sh || !sl) return null;
+  const range = sh.price - sl.price;
+  if (range <= 0) return null;
+  const rangePct = range / sl.price;
+  if (rangePct < 0.05) return null; // too small a swing to be meaningful
+
+  const isUpSwing = sh.index > sl.index; // low happened first, then high
+  let levels;
+  if (isUpSwing) {
+    levels = { f382: sh.price - range * 0.382, f500: sh.price - range * 0.5, f618: sh.price - range * 0.618, f786: sh.price - range * 0.786 };
+  } else {
+    levels = { f382: sl.price + range * 0.382, f500: sl.price + range * 0.5, f618: sl.price + range * 0.618, f786: sl.price + range * 0.786 };
+  }
+  return { ...levels, swingHigh: sh, swingLow: sl, direction: isUpSwing ? 'up' : 'down', range };
+}
+
+// ---------- Breakout detection ----------
+function detectBreakoutStatus(ohlcv, sr, indicators) {
+  const last = ohlcv[ohlcv.length - 1];
+  const volRatio = indicators.volMA20Ratio || 0;
+  const formerRes = sr.allSupports.find(s => s.label.indexOf('Former Resistance') === 0 || s.label.indexOf('Former Resistance') >= 0);
+
+  if (formerRes) {
+    const nearFlip = last.low <= formerRes.price * 1.02 && last.close >= formerRes.price;
+    if (nearFlip) return { status: 'retest_entry', label: 'Retest Entry (Valid)' };
+    return { status: 'breakout_confirmed', label: 'Breakout Confirmed' };
+  }
+  if (!sr.nearestResistance) return { status: 'no_resistance', label: 'No Resistance Overhead' };
+
+  const pierced = last.high > sr.nearestResistance.price && last.close < sr.nearestResistance.price;
+  if (pierced) return { status: 'false_breakout', label: 'False Breakout Warning' };
+
+  const distPct = (sr.nearestResistance.price - last.close) / last.close;
+  if (distPct <= 0.03 && volRatio >= 1.1) return { status: 'near_breakout', label: 'Near Breakout' };
+  if (distPct <= 0.08) return { status: 'approaching', label: 'Approaching Resistance' };
+  return { status: 'none', label: 'No Breakout Signal' };
+}
+
+// ---------- Scoring ----------
+function scoreVolumeRatio(ratio) {
+  if (ratio == null) return 0;
+  if (ratio >= 2.0) return 5;
+  if (ratio >= 1.5) return 4;
+  if (ratio >= 1.2) return 3;
+  if (ratio >= 1.0) return 2;
+  return 0;
+}
+
+function scoreLiquidity(marketData) {
+  const { transactionValueB, frequencyTier, volMA20Ratio } = marketData;
+  let txScore = transactionValueB >= 50 ? 8 : transactionValueB >= 25 ? 6 : transactionValueB >= 10 ? 4 : transactionValueB >= 5 ? 2 : 0;
+  let freqScore = { 'Very Active': 7, 'Active': 5, 'Medium': 3, 'Low': 1 }[frequencyTier] || 0;
+  let volScore = scoreVolumeRatio(volMA20Ratio);
+  return { total: txScore + freqScore + volScore, txScore, freqScore, volScore, max: 20 };
+}
+
+function scoreTrend(indicators, structure, currentPrice) {
+  let s = 0;
+  if (currentPrice > indicators.ma20) s += 3;
+  if (currentPrice > indicators.ma50) s += 2;
+  if (currentPrice > indicators.ma200) s += 2;
+  if (indicators.ma20 > indicators.ma50) s += 3;
+  if (indicators.ma50 > indicators.ma200) s += 2;
+  let structScore = structure.trend === 'Bullish' ? 3 : structure.lastSwingLowType === 'HL' ? 2 : structure.trend === 'Sideways' ? 1 : 0;
+  return { total: s + structScore, maSubtotal: s, structScore, max: 15 };
+}
+
+function scoreMomentum(indicators) {
+  const r = indicators.dailyReturnPct;
+  let retScore = r > 5 ? 3 : r >= 3 ? 4 : r >= 1 ? 3 : 0;
+  const rsi = indicators.rsi || 0;
+  let rsiScore = rsi > 75 ? 0 : rsi >= 70 ? 1 : rsi >= 65 ? 3 : rsi >= 55 ? 4 : rsi >= 45 ? 2 : 0;
+  let addScore = (indicators.priceAbovePrevClose ? 2 : 0) + (indicators.macdBullish ? 2 : 0) + (indicators.macdHistRising ? 1 : 0);
+  return { total: retScore + rsiScore + addScore, retScore, rsiScore, addScore, max: 13 };
+}
+
+function scoreVolumeBreakout(indicators, structure, breakoutStatus) {
+  let volScore = scoreVolumeRatio(indicators.volMA20Ratio);
+  const pct = indicators.pctOf52WHigh || 0;
+  let high52Score = pct >= 98 ? 5 : pct >= 95 ? 4 : pct >= 90 ? 3 : pct >= 80 ? 1 : 0;
+  let setupScore = breakoutStatus.status === 'breakout_confirmed' ? 5
+    : breakoutStatus.status === 'near_breakout' ? 4
+    : structure.isHealthyConsolidation ? 3 : 0;
+  return { total: volScore + high52Score + setupScore, volScore, high52Score, setupScore, max: 15 };
+}
+
+function scoreRiskReward(rr) {
+  if (rr == null) return { total: 0, max: 5, hardSkip: false };
+  if (rr < 1.0) return { total: 0, max: 5, hardSkip: true };
+  if (rr < 1.5) return { total: 0, max: 5, hardSkip: false };
+  if (rr < 2.0) return { total: 2, max: 5, hardSkip: false };
+  if (rr < 3.0) return { total: 4, max: 5, hardSkip: false };
+  return { total: 5, max: 5, hardSkip: false };
+}
+
+function calculateScore(c) {
+  const raw = c.liquidity.total + c.trend.total + c.momentum.total + c.volumeBreakout.total + c.riskReward.total;
+  const rawMax = c.liquidity.max + c.trend.max + c.momentum.max + c.volumeBreakout.max + c.riskReward.max;
+  const score = Math.round((raw / rawMax) * 100);
+  return { raw, rawMax, score: Math.min(100, Math.max(0, score)) };
+}
+
+function classifyScore(score) {
+  if (score >= 90) return 'ELITE';
+  if (score >= 80) return 'STRONG';
+  if (score >= 70) return 'WATCHLIST';
+  if (score >= 60) return 'WEAK';
+  return 'SKIP';
+}
+
+// ============================================================
+// TESTS
+// ============================================================
+function assert(cond, msg) { if (!cond) throw new Error('FAIL: ' + msg); console.log('  ok - ' + msg); }
+
+console.log('== Test 1: SMA/EMA basic correctness ==');
+{
+  const vals = [1,2,3,4,5,6,7,8,9,10];
+  const s = sma(vals, 3);
+  assert(s[2] === 2, 'sma(period3)[2] should be avg(1,2,3)=2, got ' + s[2]);
+  assert(s[9] === 9, 'sma(period3)[9] should be avg(8,9,10)=9, got ' + s[9]);
+  const e = calculateEMA(vals, 3);
+  assert(e[2] === 2, 'ema seed should equal sma seed = 2, got ' + e[2]);
+  assert(Math.abs(e[9] - 9.0) < 0.6, 'ema should track upward trend near 9, got ' + e[9]);
+}
+
+console.log('== Test 2: RSI on monotonic increasing series should approach 100 ==');
+{
+  const vals = [];
+  for (let i = 0; i < 30; i++) vals.push(100 + i * 2);
+  const rsi = calculateRSI(vals, 14);
+  assert(rsi[29] > 95, 'RSI on pure uptrend should be near 100, got ' + rsi[29]);
+}
+console.log('== Test 3: RSI on monotonic decreasing series should approach 0 ==');
+{
+  const vals = [];
+  for (let i = 0; i < 30; i++) vals.push(200 - i * 2);
+  const rsi = calculateRSI(vals, 14);
+  assert(rsi[29] < 5, 'RSI on pure downtrend should be near 0, got ' + rsi[29]);
+}
+
+console.log('== Test 4: MACD bullish crossover on accelerating uptrend ==');
+{
+  const vals = [];
+  for (let i = 0; i < 60; i++) vals.push(100 + i * 0.3 + (i > 40 ? (i-40)*0.8 : 0));
+  const { macdLine, signalLine, histogram } = calculateMACD(vals);
+  const last = vals.length - 1;
+  assert(macdLine[last] != null, 'macd line should be computed at the end');
+  assert(macdLine[last] > 0, 'macd should be positive on accelerating uptrend, got ' + macdLine[last]);
+}
+
+console.log('== Test 5: Swing detection on synthetic zigzag ==');
+{
+  // build a clean zigzag: up to 110, down to 95, up to 130, down to 110 (Higher High, Higher Low pattern)
+  const bars = [];
+  function pushRange(fromP, toP, steps) {
+    for (let i = 0; i <= steps; i++) {
+      const p = fromP + (toP - fromP) * (i / steps);
+      bars.push({ date: 'd' + bars.length, open: p, high: p + 0.3, low: p - 0.3, close: p, volume: 1000 });
+    }
+  }
+  pushRange(100, 110, 10);
+  pushRange(110, 95, 10);
+  pushRange(95, 130, 12);
+  pushRange(130, 112, 10);
+  const swings = findSwingPoints(bars, 3);
+  const structure = detectStructure(bars, swings);
+  assert(structure.lastSwingHighType === 'HH', 'expected HH on zigzag with rising highs, got ' + structure.lastSwingHighType);
+  assert(structure.lastSwingLowType === 'HL', 'expected HL on zigzag with rising lows, got ' + structure.lastSwingLowType);
+  assert(structure.trend === 'Bullish', 'expected Bullish trend, got ' + structure.trend);
+}
+
+console.log('== Test 6: Fibonacci validity + direction ==');
+{
+  const structureUp = {
+    lastSwingHigh: { index: 20, price: 130 },
+    lastSwingLow: { index: 10, price: 100 },
+  };
+  const fib = calculateFibonacci(structureUp);
+  assert(fib !== null, 'fib should be valid for a 30% swing');
+  assert(Math.abs(fib.f500 - 115) < 0.01, 'fib 0.5 should be midpoint 115, got ' + fib.f500);
+  assert(fib.direction === 'up', 'direction should be up when high index > low index');
+
+  const structureTiny = {
+    lastSwingHigh: { index: 20, price: 101 },
+    lastSwingLow: { index: 10, price: 100 },
+  };
+  const fibTiny = calculateFibonacci(structureTiny);
+  assert(fibTiny === null, 'fib should be N/A (null) for a too-small swing (<5%)');
+}
+
+console.log('== Test 7: Scoring functions produce values within declared max ==');
+{
+  const marketData = { transactionValueB: 60, frequencyTier: 'Very Active', volMA20Ratio: 2.2 };
+  const liq = scoreLiquidity(marketData);
+  assert(liq.total === 20, 'best-case liquidity should hit max 20, got ' + liq.total);
+
+  const rr1 = scoreRiskReward(3.5);
+  assert(rr1.total === 5, 'RR 3.5 should score 5, got ' + rr1.total);
+  const rr2 = scoreRiskReward(0.8);
+  assert(rr2.hardSkip === true, 'RR 0.8 should trigger hardSkip');
+
+  const cls = classifyScore(91);
+  assert(cls === 'ELITE', 'score 91 should classify ELITE, got ' + cls);
+  const cls2 = classifyScore(65);
+  assert(cls2 === 'WEAK', 'score 65 should classify WEAK, got ' + cls2);
+}
+
+console.log('== Test 8: Full pipeline on generated mock data runs without throwing ==');
+{
+  const configs = [
+    { code: 'BBRI', basePrice: 5000, trendBias: 0.0015, volatility: 0.018, baseVolume: 8e7, event: 'breakout' },
+    { code: 'ANTM', basePrice: 1500, trendBias: 0.0005, volatility: 0.03, baseVolume: 5e7, event: 'consolidation' },
+    { code: 'BRMS', basePrice: 400, trendBias: -0.001, volatility: 0.035, baseVolume: 9e7, event: 'downtrend' },
+  ];
+  configs.forEach(cfg => {
+    const ohlcv = generateMockOHLCV(cfg, 260);
+    assert(ohlcv.length === 260, 'should generate 260 bars for ' + cfg.code);
+    const indicators = calculateIndicators(ohlcv);
+    const swings = findSwingPoints(ohlcv);
+    const structure = detectStructure(ohlcv, swings);
+    const sr = calculateSupportResistance(ohlcv, indicators, structure, indicators.currentPrice);
+    const fib = calculateFibonacci(structure);
+    const breakout = detectBreakoutStatus(ohlcv, sr, indicators);
+    const scoreComponents = {
+      liquidity: scoreLiquidity({ transactionValueB: 40, frequencyTier: 'Active', volMA20Ratio: indicators.volMA20Ratio }),
+      trend: scoreTrend(indicators, structure, indicators.currentPrice),
+      momentum: scoreMomentum(indicators),
+      volumeBreakout: scoreVolumeBreakout(indicators, structure, breakout),
+      riskReward: scoreRiskReward(2.2),
+    };
+    const scoreResult = calculateScore(scoreComponents);
+    console.log(`    ${cfg.code}: price=${indicators.currentPrice.toFixed(0)} rsi=${(indicators.rsi||0).toFixed(1)} trend=${structure.trend} breakout=${breakout.status} score=${scoreResult.score} (${classifyScore(scoreResult.score)}) fib=${fib?'valid':'N/A'} support=${sr.mainSupport?sr.mainSupport.price.toFixed(0):'N/A'} resistance=${sr.nearestResistance?sr.nearestResistance.price.toFixed(0):'N/A'}`);
+    assert(typeof scoreResult.score === 'number' && !isNaN(scoreResult.score), 'score should be a valid number for ' + cfg.code);
+  });
+}
+
+console.log('\nALL TESTS PASSED');
